@@ -1,0 +1,9 @@
+{
+  "kind": "firebase",
+  "apiKey": "AIzaSyBQbU3X3UaN5mLqSS1gEiE2zg-fhnCTbWs",
+  "authDomain": "buzzerll.firebaseapp.com",
+  "projectId": "buzzerll",
+  "storageBucket": "buzzerll.firebasestorage.app",
+  "appId": "1:555599529054:web:775fb94d77d7f8a4b520cf",
+  "messagingSenderId": "555599529054"
+}
