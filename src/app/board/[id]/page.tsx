@@ -2,8 +2,13 @@
 // 게시글 상세 (4.2) — 본문 렌더(격리 새니타이즈) · 접기 · 댓글+대댓글
 import React, { useMemo, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
+import { useHrefBlock } from '@/components/shell/MenuGuard';
+import { extraBoardHref } from '@/lib/menuStore';
 import { useAuth } from '@/lib/auth';
-import { useLocalList, BOARD_SEED, Post, Comment, newId, fmtDate } from '@/lib/postStore';
+import {
+  useLocalList, BOARD_SEED, Post, Comment, newId, fmtDate,
+  CommentRow, COMMENT_KEY, COMMENT_SEED, commentsFor,
+} from '@/lib/postStore';
 import { useBoards, boardHref, MAIN_BOARD_ID, BoardPerm } from '@/lib/boardStore';
 import { renderBody } from '@/lib/sanitize';
 import { KInput } from '@/components/ui/Kit';
@@ -20,20 +25,27 @@ export default function BoardDetailPage() {
   const { user, isAdmin } = useAuth();
   const toast = useToast();
   const [posts, setPosts, loaded] = useLocalList<Post>('ohome.board.v1', BOARD_SEED);
+  // 댓글은 글과 따로 저장된다 (v2.0) — 글 안에 두면 댓글을 달 때 글을 UPDATE 해야 해서
+  // 일반 회원이 관리자 글에 댓글을 달 수 없었다 (포크 사용자 제보)
+  const [cmtRows, setCmtRows] = useLocalList<CommentRow>(COMMENT_KEY, COMMENT_SEED);
   const { boards } = useBoards();                  // 소속 게시판 (5.2 다중 게시판)
   const [open, setOpen] = useState(false);         // 접기 해제
   const [cmt, setCmt] = useState('');
   const [replyTo, setReplyTo] = useState<string | null>(null);
   const [delAsk, setDelAsk] = useState(false);
   const [gName, setGName] = useState('');                       // 게스트 닉네임 (방문자 댓글 허용 시)
-  const [gPw, setGPw] = useState('');                           // 게스트 비밀번호
-  const [pwAsk, setPwAsk] = useState<Comment | null>(null);     // 게스트 댓글 삭제 — 비밀번호 확인
-  const [pwInput, setPwInput] = useState('');
 
   const post = posts.find(p => p.id === id);
+  /* 이 글이 속한 곳이 비공개면 주소로 들어와도 열리지 않게 (v2.0 사용자 요청).
+     글 주소에는 섹션이 없어 MenuGuard가 못 막는다 — 글을 읽어 소속을 알아낸 여기서 판정한다.
+     **다른 early return보다 먼저 불러야 한다**(훅이므로 렌더마다 개수가 같아야 한다) */
+  const bid = post?.boardId ?? MAIN_BOARD_ID;
+  const blocked = useHrefBlock(post && (bid === MAIN_BOARD_ID ? '/board' : extraBoardHref(bid)));
   // loaded 이후에만 본문 렌더 (SSR/하이드레이션 불일치 방지)
   const html = useMemo(() => (post && loaded ? renderBody(post.mode, post.body) : ''), [post, loaded]);
 
+  // 막힌 곳이면 여기서 되돌아간다 — 훅을 모두 부른 뒤여야 렌더마다 개수가 같다
+  if (blocked) return blocked;
   if (!loaded) return <section className="page" />;
   if (!post) {
     return (
@@ -42,7 +54,10 @@ export default function BoardDetailPage() {
       </section>
     );
   }
-  if (post.secret && !isAdmin && post.authorId !== user?.id) {
+  /* 글쓴이인지 한 곳에서 정한다 (v2.0 발견) — 예전 글이나 손님이 쓴 글은 authorId가 없고
+     비로그인 방문자도 user?.id가 없어, 서로 「같다」고 판정돼 **비밀글이 그대로 열렸다.** */
+  const isAuthor = !!post.authorId && post.authorId === user?.id;
+  if (post.secret && !isAdmin && !isAuthor) {
     return (
       <section className="page">
         <div className="page-head"><PageTitle>BOARD</PageTitle><p>비밀글 — 작성자와 관리자만 열람할 수 있습니다</p></div>
@@ -57,41 +72,33 @@ export default function BoardDetailPage() {
   const guestMode = !user && board.permComment === 'guest';
   const canComment = allow(board.permComment) && (!!user || guestMode);
 
-  const canManage = isAdmin || post.authorId === user?.id;
+  const canManage = isAdmin || isAuthor;
   const update = (patch: Partial<Post>) =>
     setPosts(posts.map(p => (p.id === post.id ? { ...p, ...patch } : p)));
+
+  // 이 글의 댓글 — 분리 저장분 + 옛 글 안에 남아 있던 것 (v2.0)
+  const comments = commentsFor(cmtRows, 'post', post.id, post.comments);
 
   const addComment = () => {
     if (!canComment) { toast('댓글은 로그인 후 작성할 수 있습니다'); return; }
     if (!cmt.trim()) return;
-    if (guestMode && (!gName.trim() || !gPw)) { toast('게스트는 닉네임과 비밀번호를 입력해 주세요'); return; }
-    const c: Comment = user
-      ? {
-        id: newId(), author: user.nickname, authorId: user.id,
-        text: cmt.trim(), date: new Date().toISOString(),
-        parentId: replyTo ?? undefined,
-      }
-      : {
-        id: newId(), author: gName.trim(), authorId: '', guestPw: gPw,
-        text: cmt.trim(), date: new Date().toISOString(),
-        parentId: replyTo ?? undefined,
-      };
-    update({ comments: [...post.comments, c] });
+    if (guestMode && !gName.trim()) { toast('닉네임을 입력해 주세요'); return; }
+    const base = { id: newId(), text: cmt.trim(), date: new Date().toISOString(), parentId: replyTo ?? undefined };
+    const c: CommentRow = user
+      ? { ...base, target: 'post', targetId: post.id, author: user.nickname, authorId: user.id }
+      : { ...base, target: 'post', targetId: post.id, author: gName.trim(), authorId: '' };
+    setCmtRows([...cmtRows, c]);
     setCmt(''); setReplyTo(null);
   };
 
-  // 게스트 댓글 삭제 — 작성 시 비밀번호 확인
-  const removeComment = (c: Comment) =>
-    update({ comments: post.comments.filter(x => x.id !== c.id && x.parentId !== c.id) });
-  const confirmPw = () => {
-    if (!pwAsk) return;
-    if (pwInput !== pwAsk.guestPw) { toast('비밀번호가 일치하지 않습니다'); return; }
-    removeComment(pwAsk);
-    setPwAsk(null);
+  // 댓글 삭제 — 대댓글도 함께. 옛 글 안에 있던 댓글이면 글 쪽에서 지운다 (v2.0)
+  const removeComment = (c: Comment) => {
+    const gone = (x: { id: string; parentId?: string }) => x.id === c.id || x.parentId === c.id;
+    if (cmtRows.some(gone)) setCmtRows(cmtRows.filter(x => !gone(x)));
+    if (post.comments.some(gone)) update({ comments: post.comments.filter(x => !gone(x)) });
   };
-
-  const roots = post.comments.filter(c => !c.parentId);
-  const childrenOf = (pid: string) => post.comments.filter(c => c.parentId === pid);
+  const roots = comments.filter(c => !c.parentId);
+  const childrenOf = (pid: string) => comments.filter(c => c.parentId === pid);
 
   const CmtRow = ({ c, depth }: { c: Comment; depth: number }) => (
     <div className={`cmt ${depth > 0 ? 'reply-depth' : ''}`}>
@@ -102,12 +109,10 @@ export default function BoardDetailPage() {
           {replyTo === c.id ? '답글 취소' : '답글'}
         </small>
       )}
-      {(isAdmin || (user && c.authorId === user.id) || (!c.authorId && c.guestPw)) && (
+      {/* 손님 댓글은 관리자만 지운다 (v2.0 사용자 확정) — 서버가 그렇게밖에 못 받는다 */}
+      {(isAdmin || (user && c.authorId === user.id)) && (
         <small style={{ cursor: 'var(--cur-pointer,pointer)', marginLeft: 8 }}
-          onClick={() => {
-            if (isAdmin || (user && c.authorId === user.id)) removeComment(c);
-            else { setPwInput(''); setPwAsk(c); }   // 게스트 댓글 — 비밀번호 확인
-          }}>
+          onClick={() => removeComment(c)}>
           삭제
         </small>
       )}
@@ -122,7 +127,7 @@ export default function BoardDetailPage() {
         <p>{post.notice ? '공지 · ' : `${post.category} · `}{post.author} · {fmtDate(post.date)}</p>
         <div className="head-actions">
           {/* 수정은 작성자 본인만 — 관리자도 타인 글은 삭제만 (v1.9) */}
-          {post.authorId === user?.id && (
+          {isAuthor && (
             <button className="btn btn-dark" onClick={() => router.push(`/board/write?edit=${post.id}`)}>EDIT</button>
           )}
           {canManage && (
@@ -158,7 +163,7 @@ export default function BoardDetailPage() {
       <div className="panel" style={{ padding: 0, marginTop: 16 }}>
         <div style={{ padding: '16px 18px' }}>
           <h4 style={{ fontSize: 11.5, letterSpacing: '.12em', color: 'var(--faint)', marginBottom: 13 }}>
-            COMMENTS {post.comments.length > 0 && <span style={{ color: 'var(--accent)' }}>{post.comments.length}</span>}
+            COMMENTS {comments.length > 0 && <span style={{ color: 'var(--accent)' }}>{comments.length}</span>}
           </h4>
           {roots.map(c => (
             <React.Fragment key={c.id}>
@@ -166,14 +171,14 @@ export default function BoardDetailPage() {
               {childrenOf(c.id).map(cc => <CmtRow key={cc.id} c={cc} depth={1} />)}
             </React.Fragment>
           ))}
-          {post.comments.length === 0 && (
+          {comments.length === 0 && (
             <p style={{ fontSize: 12, color: 'var(--faint)' }}>첫 댓글을 남겨보세요</p>
           )}
         </div>
         {canComment ? (
           /* 게스트 작성(방문자 허용) — 구분선 아래 GUEST 바 + 입력줄 세로 배치 */
           <div className={`cmt-input ${guestMode ? 'guest' : ''}`}>
-            {guestMode && <GuestIdBar name={gName} pw={gPw} onName={setGName} onPw={setGPw} />}
+            {guestMode && <GuestIdBar name={gName} onName={setGName} />}
             <div className="ci-row" style={guestMode ? undefined : { display: 'contents' }}>
               <KInput
                 placeholder={replyTo ? '답글 작성...' : '댓글 남기기...'}
@@ -190,21 +195,15 @@ export default function BoardDetailPage() {
         )}
       </div>
 
-      {/* 게스트 댓글 삭제 — 작성 시 입력한 비밀번호 확인 */}
-      <Modal open={pwAsk !== null} onClose={() => setPwAsk(null)} small title="댓글 삭제"
-        actions={<>
-          <button className="btn btn-ghost" onClick={() => setPwAsk(null)}>CANCEL</button>
-          <button className="btn btn-dark" onClick={confirmPw}>OK</button>
-        </>}>
-        <KInput placeholder="작성 시 입력한 비밀번호" type="password" value={pwInput} autoFocus
-          onChange={e => setPwInput(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') confirmPw(); }} />
-      </Modal>
-
       <ConfirmModal open={delAsk} title="글을 삭제하시겠습니까?" body="삭제한 글은 복구할 수 없습니다."
         onClose={() => setDelAsk(false)}
         buttons={[
-          { label: 'DELETE', kind: 'accent', onClick: () => { setPosts(posts.filter(p => p.id !== post.id)); router.push(boardHref(board.id)); } },
+          { label: 'DELETE', kind: 'accent', onClick: () => {
+            setPosts(posts.filter(p => p.id !== post.id));
+            // 글에 딸린 댓글도 함께 지운다 — 따로 저장되므로 남겨 두면 주인 없는 줄이 된다 (v2.0)
+            setCmtRows(cmtRows.filter(c => !(c.target === 'post' && c.targetId === post.id)));
+            router.push(boardHref(board.id));
+          } },
           { label: 'CANCEL', kind: 'ghost', onClick: () => setDelAsk(false) },
         ]} />
     </section>
